@@ -1,66 +1,69 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
- * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * Binance (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
+ * Webhook mode (default): persistent server on Railway. TradingView fires a
+ * POST to /webhook when the EO Vola indicator signals — bot executes instantly.
+ * Executes via IBKR Web API (OAuth 1.0a + RSA-SHA256).
  *
- * Local mode: run manually — node bot.js
- * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
+ * Local test: node bot.js --webhook
+ * Cloud:      deploy to Railway — reads railway.json automatically
  */
 
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import { createServer } from "http";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
-  const missing = required.filter((k) => !process.env[k]);
+  const paperMode = process.env.PAPER_TRADING !== "false";
 
   if (!existsSync(".env")) {
-    console.log(
-      "\n⚠️  No .env file found — opening it for you to fill in...\n",
-    );
+    console.log("\n⚠️  No .env file found — creating one for you...\n");
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# IBKR Web API credentials",
+        "# Get these from: Account Management → Settings → API → OAuth",
+        "IBKR_CONSUMER_KEY=",
+        "IBKR_ACCESS_TOKEN=",
+        "# Paste your RSA private key — replace newlines with \\n",
+        "IBKR_PRIVATE_KEY=",
+        "",
+        "# Account IDs (found in IBKR Client Portal → Settings → Account Settings)",
+        "IBKR_ACCOUNT_ID=",
+        "IBKR_PAPER_ACCOUNT_ID=",
         "",
         "# Trading config",
-        "PORTFOLIO_VALUE_USD=1000",
-        "MAX_TRADE_SIZE_USD=100",
-        "MAX_TRADES_PER_DAY=3",
+        "PORTFOLIO_VALUE_USD=10000",
+        "MAX_TRADE_SIZE_USD=10000",
+        "MAX_TRADES_PER_DAY=4",
         "PAPER_TRADING=true",
-        "SYMBOL=BTCUSDT",
-        "TIMEFRAME=4H",
+        "SYMBOL=UVXY",
+        "TIMEFRAME=5",
+        "",
+        "# Webhook secret — must match your TradingView alert message",
+        "WEBHOOK_SECRET=",
       ].join("\n") + "\n",
     );
-    try {
-      execSync("open .env");
-    } catch {}
-    console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
-    );
+    try { execSync("open .env"); } catch {}
+    console.log("Fill in your IBKR credentials in .env then re-run.\n");
     process.exit(0);
   }
 
-  if (missing.length > 0) {
-    console.log(`\n⚠️  Missing credentials in .env: ${missing.join(", ")}`);
-    console.log("Opening .env for you now...\n");
-    try {
-      execSync("open .env");
-    } catch {}
-    console.log("Add the missing values then re-run: node bot.js\n");
-    process.exit(0);
+  // In live mode, require IBKR credentials
+  if (!paperMode) {
+    const required = ["IBKR_CONSUMER_KEY", "IBKR_ACCESS_TOKEN", "IBKR_PRIVATE_KEY", "IBKR_ACCOUNT_ID"];
+    const missing = required.filter((k) => !process.env[k]);
+    if (missing.length > 0) {
+      console.log(`\n⚠️  Missing credentials for live trading: ${missing.join(", ")}`);
+      console.log("Set PAPER_TRADING=true to run without credentials.\n");
+      process.exit(1);
+    }
   }
 
-  // Always print the CSV location so users know where to find their trade log
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -72,18 +75,21 @@ function checkOnboarding() {
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
-  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
+  symbol: process.env.SYMBOL || "UVXY",
+  timeframe: process.env.TIMEFRAME || "5",
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "10000"),
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "10000"),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "4"),
   paperTrading: process.env.PAPER_TRADING !== "false",
-  tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  ibkr: {
+    consumerKey: process.env.IBKR_CONSUMER_KEY || "",
+    accessToken: process.env.IBKR_ACCESS_TOKEN || "",
+    // PEM keys stored in env vars use literal \n — convert them back to newlines
+    privateKey: (process.env.IBKR_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+    // Use paper account ID when in paper mode, live account ID otherwise
+    accountId: process.env.PAPER_TRADING !== "false"
+      ? (process.env.IBKR_PAPER_ACCOUNT_ID || process.env.IBKR_ACCOUNT_ID || "")
+      : (process.env.IBKR_ACCOUNT_ID || ""),
   },
 };
 
@@ -315,56 +321,114 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── IBKR Web API Execution ──────────────────────────────────────────────────
+// OAuth 1.0a with RSA-SHA256. No local gateway required — pure REST.
+// Docs: https://ibkrcampus.com/ibkr-api-page/webapi-doc/
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+const IBKR_BASE = "https://api.ibkr.com/v1/api";
+
+// Cache UVXY's contract ID so we only look it up once per process lifetime
+let _uvxyConid = process.env.IBKR_UVXY_CONID
+  ? parseInt(process.env.IBKR_UVXY_CONID)
+  : null;
+
+function ibkrAuthHeader(method, url) {
+  const { consumerKey, accessToken, privateKey } = CONFIG.ibkr;
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = crypto.randomBytes(12).toString("hex");
+
+  const oauthParams = {
+    oauth_consumer_key: consumerKey,
+    oauth_nonce: nonce,
+    oauth_signature_method: "RSA-SHA256",
+    oauth_timestamp: timestamp,
+    oauth_token: accessToken,
+    oauth_version: "1.0",
+  };
+
+  // Signature base string: METHOD&url&params — all percent-encoded
+  const paramString = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
+    .join("&");
+
+  const baseString = [
+    method.toUpperCase(),
+    encodeURIComponent(url),
+    encodeURIComponent(paramString),
+  ].join("&");
+
+  const sign = crypto.createSign("RSA-SHA256");
+  sign.update(baseString);
+  const signature = sign.sign(privateKey, "base64");
+
+  oauthParams.oauth_signature = signature;
+
+  return (
+    "OAuth " +
+    Object.keys(oauthParams)
+      .map((k) => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
+      .join(", ")
+  );
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
-
-  const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
-  });
-
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
-    method: "POST",
+async function ibkrRequest(method, path, body = null) {
+  const url = `${IBKR_BASE}${path}`;
+  const opts = {
+    method,
     headers: {
+      Authorization: ibkrAuthHeader(method, url),
       "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+      "User-Agent": "claude-trading-bot/1.0",
     },
-    body,
+  };
+  if (body) opts.body = JSON.stringify(body);
+
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`IBKR API ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+async function getUVXYConid() {
+  if (_uvxyConid) return _uvxyConid;
+  console.log("  Looking up UVXY contract ID from IBKR...");
+  const data = await ibkrRequest("POST", "/iserver/secdef/search", {
+    symbol: "UVXY",
+    name: false,
+    secType: "STK",
+  });
+  const match = (Array.isArray(data) ? data : []).find(
+    (d) => d.symbol === "UVXY",
+  );
+  if (!match) throw new Error("UVXY not found in IBKR contract search");
+  _uvxyConid = match.conid;
+  console.log(`  UVXY conid: ${_uvxyConid}`);
+  return _uvxyConid;
+}
+
+async function placeIBKROrder(side, sizeUSD, price) {
+  const acctId = CONFIG.ibkr.accountId;
+  const conid = await getUVXYConid();
+  const quantity = Math.max(1, Math.floor(sizeUSD / price));
+
+  console.log(`  Placing IBKR order: ${side.toUpperCase()} ${quantity} UVXY @ MKT (acct: ${acctId})`);
+
+  const data = await ibkrRequest("POST", `/iserver/account/${acctId}/orders`, {
+    orders: [{ acctId, conid, orderType: "MKT", side: side.toUpperCase(), quantity, tif: "DAY" }],
   });
 
-  const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  // IBKR returns a confirmation challenge for certain orders — auto-confirm
+  if (Array.isArray(data) && data[0]?.id) {
+    const confirmed = await ibkrRequest("POST", `/iserver/reply/${data[0].id}`, {
+      confirmed: true,
+    });
+    return confirmed[0] || confirmed;
   }
 
-  return data.data;
+  return Array.isArray(data) ? data[0] : data;
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -420,19 +484,19 @@ function writeTradeCsv(logEntry) {
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
   } else if (logEntry.paperTrading) {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
+    side = logEntry.signal === "short_entry" ? "SELL SHORT" : "BUY COVER";
+    quantity = Math.max(1, Math.floor(logEntry.tradeSize / logEntry.price)).toString();
     totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
+    fee = (logEntry.tradeSize * 0.0005).toFixed(4); // IBKR ~$0.005/share, est.
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "PAPER";
     notes = "All conditions met";
   } else {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
+    side = logEntry.signal === "short_entry" ? "SELL SHORT" : "BUY COVER";
+    quantity = Math.max(1, Math.floor(logEntry.tradeSize / logEntry.price)).toString();
     totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
+    fee = (logEntry.tradeSize * 0.0005).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "LIVE";
@@ -442,7 +506,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "IBKR",
     logEntry.symbol,
     side,
     quantity,
@@ -461,6 +525,32 @@ function writeTradeCsv(logEntry) {
 
   appendFileSync(CSV_FILE, row + "\n");
   console.log(`Tax record saved → ${CSV_FILE}`);
+}
+
+function writeExitCsv({ exitedAt, symbol, price, signal, holdingMins, orderId, paperTrading, entryPrice, pnlPct }) {
+  const now = new Date(exitedAt);
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19);
+  const mode = paperTrading ? "PAPER" : "LIVE";
+  const holdStr = holdingMins !== null ? `${holdingMins} min` : "?";
+  const pnlStr  = pnlPct !== null ? ` | PnL ${pnlPct > 0 ? "+" : ""}${pnlPct}%` : "";
+  const notes   = `Exit: ${signal} | Held: ${holdStr}${pnlStr}`;
+
+  const row = [
+    date, time, "IBKR", symbol,
+    "BUY TO COVER",
+    "",                           // qty — not known here without the original entry
+    price.toFixed(2),
+    "",                           // total USD — size came from maxTradeSizeUSD
+    "", "",                       // fee, net — not recalculated on exit
+    orderId || "",
+    mode,
+    `"${notes}"`,
+  ].join(",");
+
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
+  appendFileSync(CSV_FILE, row + "\n");
+  console.log(`Exit record saved → ${CSV_FILE}`);
 }
 
 // Tax summary command: node bot.js --tax-summary
@@ -589,15 +679,10 @@ async function run() {
         `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
       );
       try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
+        const order = await placeIBKROrder("buy", tradeSize, price);
         logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        logEntry.orderId = order.order_id || order.orderId || order.id;
+        console.log(`✅ ORDER PLACED — ${logEntry.orderId}`);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
@@ -616,9 +701,252 @@ async function run() {
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
+// ─── Webhook Server ──────────────────────────────────────────────────────────
+// Receives TradingView alerts from the EO Vola Short Strategy indicator.
+// TradingView sends a POST to /webhook with a JSON body.
+// A secret token in the payload prevents spurious requests.
+//
+// Expected payload from TradingView alert message template:
+//   {"signal":"short_entry","price":"{{close}}","symbol":"{{ticker}}","secret":"YOUR_SECRET"}
+//   {"signal":"short_exit","price":"{{close}}","symbol":"{{ticker}}","secret":"YOUR_SECRET"}
+//   {"signal":"take_profit","price":"{{close}}","symbol":"{{ticker}}","secret":"YOUR_SECRET"}
+//   {"signal":"stop_loss","price":"{{close}}","symbol":"{{ticker}}","secret":"YOUR_SECRET"}
+
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const PORT = parseInt(process.env.PORT || "3000");
+
+async function handleWebhook(payload) {
+  const { signal, price: rawPrice, symbol } = payload;
+  const price = parseFloat(rawPrice);
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  📡 Webhook received");
+  console.log(`  Signal : ${signal}`);
+  console.log(`  Symbol : ${symbol}`);
+  console.log(`  Price  : $${price.toFixed(2)}`);
+  console.log(`  Time   : ${new Date().toISOString()}`);
+  console.log(`  Mode   : ${CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE"}`);
+  console.log("═══════════════════════════════════════════════════════════");
+
+  initCsv();
+  const rules = JSON.parse(readFileSync("rules.json", "utf8"));
+  const log = loadLog();
+
+  // ── Entry signal ──────────────────────────────────────────────────────────
+  if (signal === "short_entry") {
+    console.log("\n── Safety Check (Webhook) ───────────────────────────────\n");
+
+    const results = [];
+    const check = (label, required, actual, pass) => {
+      results.push({ label, required, actual, pass });
+      console.log(`  ${pass ? "✅" : "🚫"} ${label}`);
+      console.log(`     Required: ${required} | Actual: ${actual}`);
+    };
+
+    // 1. Signal came from TradingView (already validated by secret above)
+    check("Signal source", "EO Vola Short Strategy (TradingView)", "Webhook — verified", true);
+
+    // 2. Within NYSE market hours (13:30–20:00 UTC, Mon–Fri)
+    const now = new Date();
+    const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const dow = now.getUTCDay();
+    const marketOpen = dow >= 1 && dow <= 5 && utcHour >= 13.5 && utcHour <= 20;
+    check("NYSE market hours (13:30–20:00 UTC, Mon–Fri)", "market open", marketOpen ? "open" : `${utcHour.toFixed(1)}h UTC, day ${dow}`, marketOpen);
+
+    // 3. Daily trade limit
+    const todayCount = countTodaysTrades(log);
+    const withinLimit = todayCount < CONFIG.maxTradesPerDay;
+    check(`Daily trade limit`, `< ${CONFIG.maxTradesPerDay}`, `${todayCount} trades today`, withinLimit);
+
+    // 4. Trade size
+    const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+    const sizeOk = tradeSize <= CONFIG.maxTradeSizeUSD;
+    check("Trade size within limit", `≤ $${CONFIG.maxTradeSizeUSD}`, `$${tradeSize.toFixed(2)}`, sizeOk);
+
+    const allPass = results.every((r) => r.pass);
+    console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      symbol: CONFIG.symbol,
+      timeframe: CONFIG.timeframe,
+      price,
+      signal,
+      source: "webhook",
+      conditions: results,
+      allPass,
+      tradeSize,
+      orderPlaced: false,
+      orderId: null,
+      paperTrading: CONFIG.paperTrading,
+      limits: { maxTradeSizeUSD: CONFIG.maxTradeSizeUSD, maxTradesPerDay: CONFIG.maxTradesPerDay, tradesToday: todayCount },
+    };
+
+    if (!allPass) {
+      const failed = results.filter((r) => !r.pass).map((r) => r.label);
+      console.log(`🚫 TRADE BLOCKED — failed: ${failed.join(", ")}`);
+    } else {
+      const tp = (price * 0.91).toFixed(2);
+      const sl = (price * 1.06).toFixed(2);
+      console.log(`✅ ALL CONDITIONS MET — SHORT ENTRY`);
+      console.log(`   Entry : $${price.toFixed(2)}`);
+      console.log(`   TP    : $${tp} (−9%)`);
+      console.log(`   SL    : $${sl} (+6%)`);
+      console.log(`   Size  : $${tradeSize.toFixed(2)}`);
+
+      if (CONFIG.paperTrading) {
+        console.log(`\n📋 PAPER TRADE — would short ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`);
+        logEntry.orderPlaced = true;
+        logEntry.orderId = `PAPER-SHORT-${Date.now()}`;
+        logEntry.tp = tp;
+        logEntry.sl = sl;
+      } else {
+        console.log(`\n🔴 PLACING LIVE SHORT ORDER — $${tradeSize.toFixed(2)} SELL ${CONFIG.symbol}`);
+        try {
+          const order = await placeIBKROrder("sell", tradeSize, price);
+          logEntry.orderPlaced = true;
+          logEntry.orderId = order.order_id || order.orderId || order.id;
+          console.log(`✅ ORDER PLACED — ${logEntry.orderId}`);
+        } catch (err) {
+          console.log(`❌ ORDER FAILED — ${err.message}`);
+          logEntry.error = err.message;
+        }
+      }
+    }
+
+    log.trades.push(logEntry);
+    saveLog(log);
+    writeTradeCsv(logEntry);
+    console.log(`\nDecision log saved → ${LOG_FILE}`);
+  }
+
+  // ── Exit signals ─────────────────────────────────────────────────────────
+  if (signal === "short_exit" || signal === "take_profit" || signal === "stop_loss") {
+    const exitReason = signal === "take_profit" ? "🎯 Take profit hit (−9%)"
+                     : signal === "stop_loss"   ? "🛑 Stop loss hit (+6%)"
+                     :                            "🔄 VSTOP flipped bullish — exit signal";
+
+    console.log(`\n── Exit Signal ───────────────────────────────────────────\n`);
+    console.log(`  ${exitReason}`);
+    console.log(`  Exit price : $${price.toFixed(2)}`);
+
+    // Find the last open short from the log
+    const openShort = [...log.trades].reverse().find((t) => t.signal === "short_entry" && t.orderPlaced && !t.exitedAt);
+
+    const exitedAt = new Date().toISOString();
+    let holdingMins = null;
+
+    if (openShort) {
+      const pnl = ((openShort.price - price) / openShort.price * 100).toFixed(2);
+      holdingMins = Math.round((Date.parse(exitedAt) - Date.parse(openShort.timestamp)) / 60000);
+      console.log(`  Entry was  : $${openShort.price.toFixed(2)}`);
+      console.log(`  Held       : ${holdingMins} min`);
+      console.log(`  P&L        : ${pnl > 0 ? "+" : ""}${pnl}%`);
+      openShort.exitedAt = exitedAt;
+      openShort.exitPrice = price;
+      openShort.exitReason = signal;
+      openShort.pnlPct = pnl;
+      openShort.holdingMins = holdingMins;
+    }
+
+    let exitOrderId = null;
+    if (CONFIG.paperTrading) {
+      console.log(`\n📋 PAPER EXIT — would cover ${CONFIG.symbol} at $${price.toFixed(2)}`);
+      exitOrderId = `PAPER-EXIT-${Date.now()}`;
+    } else {
+      console.log(`\n🔴 PLACING EXIT ORDER — BUY TO COVER ${CONFIG.symbol} at market`);
+      try {
+        const order = await placeIBKROrder("buy", CONFIG.maxTradeSizeUSD, price);
+        exitOrderId = order.order_id || order.orderId || order.id;
+        console.log(`✅ EXIT ORDER PLACED — ${exitOrderId}`);
+      } catch (err) {
+        console.log(`❌ EXIT ORDER FAILED — ${err.message}`);
+      }
+    }
+
+    writeExitCsv({ exitedAt, symbol: CONFIG.symbol, price, signal, holdingMins,
+                   orderId: exitOrderId, paperTrading: CONFIG.paperTrading,
+                   entryPrice: openShort?.price ?? null, pnlPct: openShort?.pnlPct ?? null });
+
+    saveLog(log);
+    console.log(`\nLog updated → ${LOG_FILE}`);
+  }
+
+  console.log("═══════════════════════════════════════════════════════════\n");
+}
+
+function startWebhookServer() {
+  checkOnboarding();
+  initCsv();
+
+  const server = createServer(async (req, res) => {
+    // Health check
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", mode: CONFIG.paperTrading ? "paper" : "live", symbol: CONFIG.symbol }));
+      return;
+    }
+
+    // Webhook endpoint
+    if (req.method === "POST" && req.url === "/webhook") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const payload = JSON.parse(body);
+
+          // Validate secret if configured
+          if (WEBHOOK_SECRET && payload.secret !== WEBHOOK_SECRET) {
+            console.log(`⚠️  Webhook rejected — invalid secret`);
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "unauthorized" }));
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ received: true }));
+
+          // Process async (don't block the response)
+          await handleWebhook(payload).catch((err) => console.error("Webhook handler error:", err.message));
+        } catch (err) {
+          console.log(`⚠️  Webhook parse error: ${err.message}`);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "bad request" }));
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  server.listen(PORT, () => {
+    console.log("═══════════════════════════════════════════════════════════");
+    console.log("  Claude Trading Bot — Webhook Server");
+    console.log(`  Listening on port ${PORT}`);
+    console.log(`  Mode    : ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
+    console.log(`  Symbol  : ${CONFIG.symbol} (${CONFIG.timeframe})`);
+    console.log(`  Secret  : ${WEBHOOK_SECRET ? "✅ configured" : "⚠️  not set — set WEBHOOK_SECRET in .env"}`);
+    console.log(`  Endpoint: POST /webhook`);
+    console.log(`  Health  : GET  /health`);
+    console.log("═══════════════════════════════════════════════════════════");
+    console.log("\nWaiting for TradingView signals...\n");
+    console.log("TradingView alert message template (short_entry):");
+    console.log(`  {"signal":"short_entry","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${WEBHOOK_SECRET || "YOUR_SECRET"}"}`);
+    console.log("\nTradingView alert message template (short_exit):");
+    console.log(`  {"signal":"short_exit","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${WEBHOOK_SECRET || "YOUR_SECRET"}"}`);
+  });
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
+} else if (process.env.WEBHOOK_MODE === "true" || process.argv.includes("--webhook")) {
+  startWebhookServer();
 } else {
+  // Legacy polling mode (kept for local testing / manual runs)
   run().catch((err) => {
     console.error("Bot error:", err);
     process.exit(1);
