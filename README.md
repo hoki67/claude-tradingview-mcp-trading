@@ -151,9 +151,15 @@ node bot.js
 
 ## Deploy to a Hostinger VPS (Run in the Cloud 24/7)
 
-The local setup runs when your laptop is open. A Hostinger VPS lets the bot check for setups around the clock — even while you sleep.
+The bot runs as a **persistent web service** on Railway. TradingView sends a webhook the instant the EO Vola indicator fires — no polling, no API rate limits, instant execution.
 
-> **Note:** Cloud mode pulls candle data directly from Binance's free market API instead of TradingView. No TradingView Desktop needed in the cloud. The strategy logic and safety check are identical.
+### How it works
+
+```
+EO Vola fires on TradingView → POST /webhook → bot executes in <1 second
+```
+
+Instead of checking every 5 minutes (288 API calls/day), the bot sleeps until TradingView wakes it up. On a typical UVXY day that's 1–3 signals.
 
 ### 1. Get a VPS
 
@@ -165,43 +171,57 @@ Once it's provisioned, Hostinger gives you an IP and root password. SSH in:
 ssh root@YOUR_VPS_IP
 ```
 
-### 2. Deploy
+Railway reads `railway.json` automatically — it starts the bot in webhook mode with a health check on `/health`.
 
-On the VPS:
+### 2. Set your environment variables in Railway
 
-```bash
-apt update && apt install -y nodejs npm git
-git clone <your-repo-url> bot && cd bot
-npm install
+Go to your Railway project → Variables and add:
+
+| Variable | Example | Notes |
+|----------|---------|-------|
+| `BITGET_API_KEY` | your key | From BitGet API settings |
+| `BITGET_SECRET_KEY` | your secret | |
+| `BITGET_PASSPHRASE` | your passphrase | |
+| `PORTFOLIO_VALUE_USD` | 1000 | Used for position sizing |
+| `MAX_TRADE_SIZE_USD` | 10000 | Hard cap per trade |
+| `MAX_TRADES_PER_DAY` | 4 | Daily limit |
+| `PAPER_TRADING` | true | Set to false when ready |
+| `SYMBOL` | UVXY | |
+| `TIMEFRAME` | 5 | Minutes |
+| `WEBHOOK_SECRET` | a-random-string | Must match your TradingView alert |
+
+### 3. Get your Railway public URL
+
+After deploying, Railway gives you a URL like `https://your-bot.up.railway.app`. Copy it.
+
+### 4. Set up TradingView alerts
+
+In TradingView, open the EO Vola Short Strategy on your UVXY 5m chart and create two alerts:
+
+**Alert 1 — Short entry**
+- Condition: `EO Vola Short Strategy: Short`
+- Webhook URL: `https://your-bot.up.railway.app/webhook`
+- Message:
+```json
+{"signal":"short_entry","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"YOUR_WEBHOOK_SECRET"}
 ```
 
-### 3. Set your environment variables
+**Alert 2 — Short exit**
+- Condition: `EO Vola Short Strategy: Exit Short`
+- Webhook URL: `https://your-bot.up.railway.app/webhook`
+- Message:
+```json
+{"signal":"short_exit","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"YOUR_WEBHOOK_SECRET"}
+```
 
-Create a `.env` file on the VPS with everything from `.env.example`:
+### 5. Verify it's working
 
-| Variable | Example |
-|----------|---------|
-| `BITGET_API_KEY` | your key |
-| `BITGET_SECRET_KEY` | your secret |
-| `BITGET_PASSPHRASE` | your passphrase |
-| `PORTFOLIO_VALUE_USD` | 1000 |
-| `MAX_TRADE_SIZE_USD` | 100 |
-| `MAX_TRADES_PER_DAY` | 3 |
-| `PAPER_TRADING` | true (set to false when ready) |
-| `SYMBOL` | BTCUSDT |
-| `TIMEFRAME` | 4H |
+```bash
+curl https://your-bot.up.railway.app/health
+# → {"status":"ok","mode":"paper","symbol":"UVXY"}
+```
 
-### 4. Set a cron schedule
-
-The bot runs one check and exits, so schedule it with the VPS's built-in cron. Run `crontab -e` and add one line matching your chart timeframe (all run from the repo dir and log to `bot.log`):
-
-| Timeframe | Crontab line | What it means |
-|-----------|----------|----------------|
-| 4H chart | `0 */4 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every 4 hours |
-| 1D chart | `0 9 * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Once a day at 9am UTC |
-| 1H chart | `0 * * * * cd /root/bot && /usr/bin/node bot.js >> bot.log 2>&1` | Every hour |
-
-### 5. Start in paper trading mode
+### 6. Start in paper trading mode
 
 `PAPER_TRADING=true` logs every decision but never places real orders. Watch a few days of paper trades, confirm the logic matches what you expect, then flip it to `false`.
 
