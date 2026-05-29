@@ -932,10 +932,15 @@ function startWebhookServer() {
     console.log(`  Health  : GET  /health`);
     console.log("═══════════════════════════════════════════════════════════");
     console.log("\nWaiting for TradingView signals...\n");
+    // Mask the secret in the alert templates — Railway logs are not private
+    // enough to print the live token in plaintext, even at startup.
+    const _maskedSecret = WEBHOOK_SECRET
+      ? "<configured-see-WEBHOOK_SECRET-in-.env>"
+      : "YOUR_SECRET";
     console.log("TradingView alert message template (short_entry):");
-    console.log(`  {"signal":"short_entry","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${WEBHOOK_SECRET || "YOUR_SECRET"}"}`);
+    console.log(`  {"signal":"short_entry","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${_maskedSecret}"}`);
     console.log("\nTradingView alert message template (short_exit):");
-    console.log(`  {"signal":"short_exit","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${WEBHOOK_SECRET || "YOUR_SECRET"}"}`);
+    console.log(`  {"signal":"short_exit","price":"{{strategy.order.price}}","symbol":"{{ticker}}","secret":"${_maskedSecret}"}`);
   });
 }
 
