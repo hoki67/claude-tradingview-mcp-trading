@@ -50,11 +50,16 @@ def verify_mapping(
 
     real_ok = False
     if close is not None and len(close) > window + 5:
+        # Label the FULL series once, then slice each known period out of it.
+        # (Labelling a short segment in isolation leaves its first `window` bars
+        # as NaN-return -> SIDEWAYS default, which buried the COVID crash under
+        # SIDEWAYS and made FIX 2 fail at every threshold.)
+        full_labels = label_price_states(close, window, threshold)
         for start, end, expected, name in KNOWN_PERIODS:
             seg = close.loc[(close.index >= start) & (close.index <= end)]
             if len(seg) < window + 5:
                 continue
-            labels = label_price_states(seg, window, threshold)
+            labels = full_labels.loc[(full_labels.index >= start) & (full_labels.index <= end)]
             if len(labels) == 0:
                 continue
             got = int(labels.mode().iloc[0])

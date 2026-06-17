@@ -31,6 +31,29 @@ def label_price_states(close: pd.Series, window: int = 20, threshold: float = 0.
     return labels.dropna()
 
 
+def label_price_states_adaptive(
+    close: pd.Series,
+    window: int = 20,
+    vol_window: int = 252,
+    sigma: float = 1.1,
+) -> pd.Series:
+    """Adaptive (vol-scaled) state labels — the Pine-2.0 rule, ported.
+
+    Instead of a fixed +/-X% threshold, the band scales with realised vol:
+        band = stdev(daily log-returns, vol_window) * sqrt(window) * sigma
+    so the SAME rule labels a calm index (SPY) and a 3x ETF (TQQQ) sensibly
+    without per-symbol tuning. >= +band -> BULL, <= -band -> BEAR, else SIDEWAYS.
+    """
+    logret = np.log(close / close.shift(1))
+    band = logret.rolling(vol_window).std() * np.sqrt(window) * sigma
+    ret = cumulative_return(close, window)
+    valid = ret.notna() & band.notna()
+    labels = pd.Series(SIDEWAYS, index=close.index, dtype=int)
+    labels[ret >= band] = BULL
+    labels[ret <= -band] = BEAR
+    return labels[valid]
+
+
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(

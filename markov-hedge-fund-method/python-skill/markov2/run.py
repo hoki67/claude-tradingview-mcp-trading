@@ -65,6 +65,7 @@ def _equity_image(before, after, ticker, source, mode) -> Path | None:
     ax.legend(loc="upper left"); ax.grid(alpha=0.25)
     fig.tight_layout()
     out = DATA_DIR / f"equity_{ticker.replace('-', '_')}_{mode}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=120); plt.close(fig)
     return out
 
