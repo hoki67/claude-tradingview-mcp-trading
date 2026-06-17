@@ -1,0 +1,23 @@
+[project]
+name = "markov-2-hedge-fund-method"
+version = "2.0.0"
+description = "Markov 2.0 (corrected) regime model: stride sampling, label verification, FILTER/STANDALONE modes"
+requires-python = "==3.12.*"
+dependencies = [
+    "yfinance>=0.2",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+hmm = ["hmmlearn>=0.3"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["markov2*"]
