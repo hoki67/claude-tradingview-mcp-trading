@@ -1,0 +1,255 @@
+//@version=5
+// =============================================================================
+// Hedge Fund Markov 2.0 — MTF STRATEGY (request.security variant)
+// Estimates the Markov regime matrix on a HIGHER timeframe and trades on the
+// chart (lower) timeframe. Same three fixes as the single-TF version:
+//   FIX 1 — Non-overlapping stride sampling is the DEFAULT; BOTH matrices are
+//           kept and the stickiness gap is shown.
+//   FIX 2 — state<->signal wiring kept consistent (0=Bull, 1=Side, 2=Bear).
+//   FIX 3 — FILTER (gate a long/short book) vs STANDALONE (size ~ |signal|).
+//
+// The whole matrix is computed INSIDE a function evaluated by request.security,
+// so the var counters advance per HTF bar (one stride = one HTF bar). Historical
+// bars use lookahead_off => no future leak => honest backtest.
+// =============================================================================
+strategy("Hedge Fund Markov 2.0 — MTF Strategy", overlay=true, max_labels_count=500,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     commission_type=strategy.commission.percent, commission_value=0.03,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ===== Inputs =====
+htfTF           = input.timeframe("D", "Higher timeframe for the matrix", group="Model")
+lookback        = input.int(20,  "Sampling & Return Window (HTF bars)", minval=2, group="Model")
+volWindow       = input.int(252, "Volatility Anchor Window (HTF bars)", minval=50, group="Model")
+sigmaMultiplier = input.float(1.1, "Sigma Multiplier (Threshold Width)", step=0.1, group="Model")
+samplingMode    = input.string("Non-overlapping", "Sampling Mode (drives live signal)", options=["Non-overlapping","Rolling"], group="Model")
+
+tradeMode   = input.string("Filter", "Trade Mode", options=["Filter","Standalone"], group="Trading")
+sigThresh   = input.float(0.10, "FILTER signal threshold", step=0.01, group="Trading")
+stdScale    = input.float(0.50, "STANDALONE scale (|signal| -> size)", step=0.05, group="Trading")
+stdCap      = input.float(1.00, "STANDALONE position cap (fraction of equity)", step=0.1, minval=0.0, maxval=1.0, group="Trading")
+allowShorts = input.bool(true,  "Allow shorts", group="Trading")
+resizeStd   = input.bool(true,  "STANDALONE: resize when |signal| moves > 0.10", group="Trading")
+confirmOnly = input.bool(true,  "Trade only on confirmed chart bar (live)", group="Trading")
+
+useDateFilter = input.bool(false, "Limit backtest window", group="Backtest window")
+startDate     = input.time(timestamp("01 Jan 2015 00:00"), "Start", group="Backtest window")
+endDate       = input.time(timestamp("01 Jan 2027 00:00"), "End",   group="Backtest window")
+
+showDashboard = input.bool(true, "Show Dashboard", group="Display")
+showLevels    = input.bool(true, "Show threshold lines", group="Display")
+
+// ===== Markov computed in the HTF context =====
+// Runs on HTF bars: state -> dual matrices -> active probs -> signal.
+f_markov(_lb, _vw, _sig, _useNO) =>
+    lr  = not na(close[1]) and close[1] > 0 ? math.log(close / close[1]) : na
+    vol = ta.stdev(lr, _vw)
+    vs  = vol * math.sqrt(_lb)
+    bt  =  vs * _sig
+    bet = -vs * _sig
+    rr  = not na(close[_lb]) and close[_lb] > 0 ? (close - close[_lb]) / close[_lb] : na
+
+    int ls = na
+    if not na(rr) and not na(bt)
+        ls := rr >= bt ? 0 : rr <= bet ? 2 : 1
+
+    isS = bar_index % _lb == 0
+    can = bar_index > _vw and not na(ls)
+
+    // Rolling / overlapping counters
+    var float r_bb=0.0
+    var float r_bs=0.0
+    var float r_bbe=0.0
+    var float r_sb=0.0
+    var float r_ss=0.0
+    var float r_sbe=0.0
+    var float r_beb=0.0
+    var float r_bes=0.0
+    var float r_bebe=0.0
+    // Non-overlapping counters
+    var float n_bb=0.0
+    var float n_bs=0.0
+    var float n_bbe=0.0
+    var float n_sb=0.0
+    var float n_ss=0.0
+    var float n_sbe=0.0
+    var float n_beb=0.0
+    var float n_bes=0.0
+    var float n_bebe=0.0
+    var int   noPrev = na
+
+    if can and not na(ls[1])
+        ps = ls[1]
+        r_bb   := r_bb   + (ps==0 and ls==0 ? 1.0 : 0.0)
+        r_bs   := r_bs   + (ps==0 and ls==1 ? 1.0 : 0.0)
+        r_bbe  := r_bbe  + (ps==0 and ls==2 ? 1.0 : 0.0)
+        r_sb   := r_sb   + (ps==1 and ls==0 ? 1.0 : 0.0)
+        r_ss   := r_ss   + (ps==1 and ls==1 ? 1.0 : 0.0)
+        r_sbe  := r_sbe  + (ps==1 and ls==2 ? 1.0 : 0.0)
+        r_beb  := r_beb  + (ps==2 and ls==0 ? 1.0 : 0.0)
+        r_bes  := r_bes  + (ps==2 and ls==1 ? 1.0 : 0.0)
+        r_bebe := r_bebe + (ps==2 and ls==2 ? 1.0 : 0.0)
+
+    if can and isS
+        if not na(noPrev)
+            n_bb   := n_bb   + (noPrev==0 and ls==0 ? 1.0 : 0.0)
+            n_bs   := n_bs   + (noPrev==0 and ls==1 ? 1.0 : 0.0)
+            n_bbe  := n_bbe  + (noPrev==0 and ls==2 ? 1.0 : 0.0)
+            n_sb   := n_sb   + (noPrev==1 and ls==0 ? 1.0 : 0.0)
+            n_ss   := n_ss   + (noPrev==1 and ls==1 ? 1.0 : 0.0)
+            n_sbe  := n_sbe  + (noPrev==1 and ls==2 ? 1.0 : 0.0)
+            n_beb  := n_beb  + (noPrev==2 and ls==0 ? 1.0 : 0.0)
+            n_bes  := n_bes  + (noPrev==2 and ls==1 ? 1.0 : 0.0)
+            n_bebe := n_bebe + (noPrev==2 and ls==2 ? 1.0 : 0.0)
+        noPrev := ls
+
+    rSb = r_bb + r_bs + r_bbe
+    rSs = r_sb + r_ss + r_sbe
+    rSe = r_beb + r_bes + r_bebe
+    nSb = n_bb + n_bs + n_bbe
+    nSs = n_sb + n_ss + n_sbe
+    nSe = n_beb + n_bes + n_bebe
+
+    rStickBull = rSb > 0 ? r_bb/rSb   : na
+    rStickBear = rSe > 0 ? r_bebe/rSe : na
+    nStickBull = nSb > 0 ? n_bb/nSb   : na
+    nStickBear = nSe > 0 ? n_bebe/nSe : na
+
+    p_bb   = _useNO ? (nSb>0?n_bb/nSb:1.0/3.0)   : (rSb>0?r_bb/rSb:1.0/3.0)
+    p_bs   = _useNO ? (nSb>0?n_bs/nSb:1.0/3.0)   : (rSb>0?r_bs/rSb:1.0/3.0)
+    p_bbe  = _useNO ? (nSb>0?n_bbe/nSb:1.0/3.0)  : (rSb>0?r_bbe/rSb:1.0/3.0)
+    p_sb   = _useNO ? (nSs>0?n_sb/nSs:1.0/3.0)   : (rSs>0?r_sb/rSs:1.0/3.0)
+    p_ss   = _useNO ? (nSs>0?n_ss/nSs:1.0/3.0)   : (rSs>0?r_ss/rSs:1.0/3.0)
+    p_sbe  = _useNO ? (nSs>0?n_sbe/nSs:1.0/3.0)  : (rSs>0?r_sbe/rSs:1.0/3.0)
+    p_beb  = _useNO ? (nSe>0?n_beb/nSe:1.0/3.0)  : (rSe>0?r_beb/rSe:1.0/3.0)
+    p_bes  = _useNO ? (nSe>0?n_bes/nSe:1.0/3.0)  : (rSe>0?r_bes/rSe:1.0/3.0)
+    p_bebe = _useNO ? (nSe>0?n_bebe/nSe:1.0/3.0) : (rSe>0?r_bebe/rSe:1.0/3.0)
+
+    tot = _useNO ? (nSb+nSs+nSe) : (rSb+rSs+rSe)
+    mixBull = tot>0 ? (_useNO?nSb:rSb)/tot : na
+    mixSide = tot>0 ? (_useNO?nSs:rSs)/tot : na
+    mixBear = tot>0 ? (_useNO?nSe:rSe)/tot : na
+
+    p_bull = ls==0 ? p_bb  : ls==1 ? p_sb  : ls==2 ? p_beb  : na
+    p_bear = ls==0 ? p_bbe : ls==1 ? p_sbe : ls==2 ? p_bebe : na
+    sig = p_bull - p_bear
+
+    [ls, sig, p_bb, p_bs, p_bbe, p_sb, p_ss, p_sbe, p_beb, p_bes, p_bebe, rStickBull, rStickBear, nStickBull, nStickBear, mixBull, mixSide, mixBear, bt, bet]
+
+useNO = samplingMode == "Non-overlapping"
+[stateH, sigH, p_bb, p_bs, p_bbe, p_sb, p_ss, p_sbe, p_beb, p_bes, p_bebe, rStickBull, rStickBear, nStickBull, nStickBear, mixBull, mixSide, mixBear, bullThr, bearThr] = request.security(syminfo.tickerid, htfTF, f_markov(lookback, volWindow, sigmaMultiplier, useNO), lookahead=barmerge.lookahead_off)
+
+liveSignal = sigH
+liveState  = stateH
+
+// ===== FIX 3: position =====
+filterPos     = na(liveSignal) ? 0.0 : liveSignal >  sigThresh ?  1.0 : liveSignal < -sigThresh ? -1.0 : 0.0
+standalonePos = na(liveSignal) ? 0.0 : math.max(-stdCap, math.min(stdCap, liveSignal / stdScale))
+float targetPos = tradeMode == "Standalone" ? standalonePos : filterPos
+if not allowShorts and targetPos < 0
+    targetPos := 0.0
+
+desiredDir = targetPos > 0 ? 1 : targetPos < 0 ? -1 : 0
+posFrac    = math.min(1.0, math.abs(targetPos))
+inWindow   = not useDateFilter or (time >= startDate and time <= endDate)
+qty        = posFrac > 0 and close > 0 ? (strategy.equity * posFrac) / close : 0.0
+canTrade   = inWindow and not na(liveState) and (not confirmOnly or barstate.isconfirmed)
+
+dirChanged  = desiredDir != desiredDir[1]
+sizeChanged = resizeStd and tradeMode == "Standalone" and math.abs(posFrac - posFrac[1]) > 0.10
+
+// ===== Orders =====
+if canTrade
+    if desiredDir == 0
+        if strategy.position_size != 0
+            strategy.close_all(comment="flat")
+    else
+        if dirChanged or sizeChanged
+            if sizeChanged and not dirChanged and strategy.position_size != 0
+                strategy.close_all(comment="resize")
+            if desiredDir == 1
+                strategy.entry("Long",  strategy.long,  qty=qty, comment="long")
+            else
+                strategy.entry("Short", strategy.short, qty=qty, comment="short")
+
+if useDateFilter and not inWindow and strategy.position_size != 0
+    strategy.close_all(comment="window end")
+
+// ===== Alerts =====
+alertcondition(targetPos > 0 and targetPos[1] <= 0, "Go LONG",  "Markov2 MTF: enter LONG")
+alertcondition(targetPos < 0 and targetPos[1] >= 0, "Go SHORT", "Markov2 MTF: enter SHORT")
+alertcondition(targetPos == 0 and targetPos[1] != 0, "Go FLAT", "Markov2 MTF: go FLAT")
+
+// ===== Visuals =====
+bullLine = showLevels and not na(bullThr) ? close * (1 + bullThr) : na
+bearLine = showLevels and not na(bearThr) ? close * (1 + bearThr) : na
+zeroLine = showLevels ? close : na
+plot(bullLine, "Bull Threshold (HTF)", color=color.new(color.green, 0), linewidth=2)
+plot(bearLine, "Bear Threshold (HTF)", color=color.new(color.red, 0),   linewidth=2)
+plot(zeroLine, "Zero Base",            color=color.new(color.gray, 40),  linewidth=1)
+plot(targetPos, "Target Position", color=color.new(color.blue,0), display=display.data_window)
+
+// HTF regime change markers (on the chart)
+bullSig = not na(liveState) and liveState == 0 and liveState[1] != 0
+sideSig = not na(liveState) and liveState == 1 and liveState[1] != 1
+bearSig = not na(liveState) and liveState == 2 and liveState[1] != 2
+plotshape(bullSig, "HTF Bull", shape.triangleup,  location.belowbar, color.new(color.green,0), size=size.tiny, text="BULL")
+plotshape(sideSig, "HTF Side", shape.circle,       location.abovebar, color.new(color.gray,0),  size=size.tiny, text="SIDE")
+plotshape(bearSig, "HTF Bear", shape.triangledown, location.abovebar, color.new(color.red,0),   size=size.tiny, text="BEAR")
+
+// ===== Dashboard =====
+var table t = table.new(position.top_right, 5, 14, bgcolor=color.new(color.black,15), border_width=1, border_color=color.gray)
+f_pct(x) => na(x) ? "n/a" : str.tostring(x*100, "#.0") + "%"
+
+if barstate.islast and showDashboard
+    wText = color.white
+    table.cell(t, 0, 0, "Markov 2.0 MTF " + str.tostring(htfTF) + " (" + (useNO?"Non-ov":"Roll") + ")", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 0, "TO BULL", text_color=color.green, text_size=size.small)
+    table.cell(t, 2, 0, "TO SIDE", text_color=color.gray,  text_size=size.small)
+    table.cell(t, 3, 0, "TO BEAR", text_color=color.red,   text_size=size.small)
+    table.cell(t, 4, 0, "MIX",     text_color=color.orange,text_size=size.small)
+
+    table.cell(t, 0, 1, "FROM BULL", text_color=wText, text_size=size.small)
+    table.cell(t, 1, 1, f_pct(p_bb),  text_color=wText, text_size=size.small)
+    table.cell(t, 2, 1, f_pct(p_bs),  text_color=wText, text_size=size.small)
+    table.cell(t, 3, 1, f_pct(p_bbe), text_color=wText, text_size=size.small)
+    table.cell(t, 4, 1, f_pct(mixBull), text_color=color.orange, text_size=size.small)
+
+    table.cell(t, 0, 2, "FROM SIDE", text_color=wText, text_size=size.small)
+    table.cell(t, 1, 2, f_pct(p_sb),  text_color=wText, text_size=size.small)
+    table.cell(t, 2, 2, f_pct(p_ss),  text_color=wText, text_size=size.small)
+    table.cell(t, 3, 2, f_pct(p_sbe), text_color=wText, text_size=size.small)
+    table.cell(t, 4, 2, f_pct(mixSide), text_color=color.orange, text_size=size.small)
+
+    table.cell(t, 0, 3, "FROM BEAR", text_color=wText, text_size=size.small)
+    table.cell(t, 1, 3, f_pct(p_beb), text_color=wText, text_size=size.small)
+    table.cell(t, 2, 3, f_pct(p_bes), text_color=wText, text_size=size.small)
+    table.cell(t, 3, 3, f_pct(p_bebe),text_color=wText, text_size=size.small)
+    table.cell(t, 4, 3, f_pct(mixBear), text_color=color.orange, text_size=size.small)
+
+    table.cell(t, 0, 5, "STICKINESS gap", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 5, "Bull " + f_pct(rStickBull) + " -> " + f_pct(nStickBull), text_color=wText, text_size=size.small)
+    table.cell(t, 3, 5, "Bear " + f_pct(rStickBear) + " -> " + f_pct(nStickBear), text_color=wText, text_size=size.small)
+
+    stStr = liveState==0?"BULL":liveState==2?"BEAR":liveState==1?"SIDEWAYS":"WAIT"
+    stCol = liveState==0?color.green:liveState==2?color.red:liveState==1?color.gray:color.orange
+    table.cell(t, 0, 6, "HTF STATE", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 6, stStr, bgcolor=color.new(stCol,50), text_color=wText, text_size=size.small)
+    table.cell(t, 0, 7, "HTF SIGNAL", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 7, str.tostring(liveSignal, "#.000"), text_color=wText, text_size=size.small)
+    table.cell(t, 0, 8, "TARGET POS (" + tradeMode + ")", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 8, str.tostring(targetPos, "#.00"), text_color=wText, text_size=size.small)
+
+    pf  = strategy.grossloss != 0 ? strategy.grossprofit / strategy.grossloss : na
+    wr  = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades : na
+    net = strategy.netprofit / strategy.initial_capital * 100
+    dd  = strategy.max_drawdown / strategy.initial_capital * 100
+    table.cell(t, 0, 10, "NET PROFIT", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 10, str.tostring(net, "#.0") + "%", text_color=wText, text_size=size.small)
+    table.cell(t, 0, 11, "PROFIT FACTOR", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 11, na(pf) ? "n/a" : str.tostring(pf, "#.00"), text_color=wText, text_size=size.small)
+    table.cell(t, 0, 12, "WIN RATE", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 12, f_pct(wr), text_color=wText, text_size=size.small)
+    table.cell(t, 0, 13, "MAX DRAWDOWN", text_color=color.yellow, text_size=size.small)
+    table.cell(t, 1, 13, str.tostring(-math.abs(dd), "#.0") + "%", text_color=wText, text_size=size.small)
